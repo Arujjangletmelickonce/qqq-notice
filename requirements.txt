@@ -1,5 +1,6 @@
-pandas
-plotly
-streamlit
-yfinance
-openai
+streamlit==1.51.0
+altair==4.2.2
+yfinance==0.2.66
+pandas==2.2.3
+plotly==6.5.2
+openai==2.24.0
