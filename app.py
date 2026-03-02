@@ -4,7 +4,7 @@ import streamlit as st
 import yfinance as yf
 from openai import OpenAI
 
-MODEL_NAME = "gpt-5.2"
+MODEL_CANDIDATES = ["gpt-5.2", "gpt-4.1", "gpt-4o"]
 
 st.set_page_config(page_title="QQQ Option Dashboard", layout="wide")
 st.title("QQQ Real-time Option Viewer and AI Briefing")
@@ -13,6 +13,30 @@ api_key = st.secrets.get("OPENAI_API_KEY", "")
 client = OpenAI(api_key=api_key) if api_key else None
 if not api_key:
     st.warning("OPENAI_API_KEY is not set. Charts will load, but AI briefing is disabled.")
+
+
+def generate_briefing_with_fallback(_client: OpenAI, prompt_text: str):
+    last_error = None
+    for model_name in MODEL_CANDIDATES:
+        try:
+            response = _client.responses.create(
+                model=model_name,
+                input=[
+                    {
+                        "role": "system",
+                        "content": "You are a Korean market-briefing assistant for general stock traders. Be specific and practical.",
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                max_output_tokens=900,
+            )
+            text = (response.output_text or "").strip()
+            if text:
+                return text, model_name, None
+            last_error = f"Model {model_name} returned empty output."
+        except Exception as error:  # noqa: BLE001
+            last_error = f"{model_name}: {error}"
+    return "", None, last_error
 
 
 @st.cache_data(ttl=120)
@@ -165,7 +189,7 @@ if current_price is None or not expirations:
 col1, col2 = st.columns([1, 3])
 with col1:
     selected_date = st.selectbox("Select expiry", expirations)
-    st.caption(f"AI model: {MODEL_NAME} (fixed)")
+    st.caption(f"AI model order: {' -> '.join(MODEL_CANDIDATES)}")
     st.metric(label=f"{ticker_symbol} spot", value=f"${current_price:.2f}")
     if st.button("Refresh data"):
         st.cache_data.clear()
@@ -341,23 +365,13 @@ if st.button("Generate AI briefing"):
                 st.error("OPENAI_API_KEY is missing. Add it in Streamlit Cloud App Settings > Secrets.")
                 st.stop()
 
-            response = client.responses.create(
-                model=MODEL_NAME,
-                input=[
-                    {
-                        "role": "system",
-                        "content": "You are a Korean market-briefing assistant for general stock traders. Be specific and practical.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_output_tokens=900,
-            )
-            analysis_text = (response.output_text or "").strip()
-            st.success("Briefing generated")
+            analysis_text, used_model, model_error = generate_briefing_with_fallback(client, prompt)
             if analysis_text:
+                st.success(f"Briefing generated (model: {used_model})")
                 st.markdown(analysis_text)
             else:
-                st.warning("Model returned no text. Showing raw response below.")
-                st.code(str(response), language="text")
+                st.error("Failed to generate briefing from all configured models.")
+                if model_error:
+                    st.code(model_error, language="text")
         except Exception as error:
             st.error(f"API call failed: {error}")
