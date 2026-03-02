@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+from typing import Any
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -5,9 +8,77 @@ import yfinance as yf
 from openai import OpenAI
 
 MODEL_CANDIDATES = ["gpt-5.2", "gpt-4.1", "gpt-4o"]
+RATE_LIMIT_COOLDOWN_SECONDS = 300
 
 st.set_page_config(page_title="QQQ Option Dashboard", layout="wide")
 st.title("QQQ Real-time Option Viewer and AI Briefing")
+
+
+def is_yf_rate_limit_error(error: Exception) -> bool:
+    return error.__class__.__name__ == "YFRateLimitError"
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_get_state(key: str, default: Any) -> Any:
+    return st.session_state.get(key, default)
+
+
+def _safe_set_state(key: str, value: Any) -> None:
+    st.session_state[key] = value
+
+
+def _set_rate_limit_block(until_ts: float, reason: str):
+    st.session_state["yf_block_until"] = float(until_ts)
+    st.session_state["yf_block_reason"] = reason
+
+
+def _clear_rate_limit_block() -> None:
+    st.session_state.pop("yf_block_until", None)
+    st.session_state.pop("yf_block_reason", None)
+
+
+def _get_rate_limit_block():
+    until = st.session_state.get("yf_block_until")
+    if not until:
+        return False, 0.0, ""
+
+    remain = float(until) - _now_utc().timestamp()
+    if remain > 0:
+        return True, remain, st.session_state.get("yf_block_reason", "")
+
+    _clear_rate_limit_block()
+    return False, 0.0, ""
+
+
+def _show_block_notice():
+    blocked, remain, reason = _get_rate_limit_block()
+    if blocked:
+        st.warning(
+            f"{reason}. API cooldown: {int(remain)}s remaining. "
+            "Cached data will be used whenever available."
+        )
+        return True
+    return False
+
+
+def _safe_call(func, *args, **kwargs):
+    blocked, _, _ = _get_rate_limit_block()
+    if blocked:
+        return None, "blocked"
+    try:
+        return func(*args, **kwargs), None
+    except Exception as error:  # noqa: BLE001
+        if is_yf_rate_limit_error(error):
+            _set_rate_limit_block(
+                _now_utc().timestamp() + RATE_LIMIT_COOLDOWN_SECONDS,
+                "Yahoo Finance rate limit reached",
+            )
+            return None, "ratelimit"
+        return None, "error"
+
 
 api_key = st.secrets.get("OPENAI_API_KEY", "")
 client = OpenAI(api_key=api_key) if api_key else None
@@ -24,7 +95,10 @@ def generate_briefing_with_fallback(_client: OpenAI, prompt_text: str):
                 input=[
                     {
                         "role": "system",
-                        "content": "You are a Korean market-briefing assistant for general stock traders. Be specific and practical.",
+                        "content": (
+                            "You are a Korean market-briefing assistant for general stock traders. "
+                            "Be specific and practical."
+                        ),
                     },
                     {"role": "user", "content": prompt_text},
                 ],
@@ -39,14 +113,9 @@ def generate_briefing_with_fallback(_client: OpenAI, prompt_text: str):
     return "", None, last_error
 
 
-def is_yf_rate_limit_error(error: Exception) -> bool:
-    return error.__class__.__name__ == "YFRateLimitError"
-
-
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1200)
 def get_stock_snapshot(ticker_symbol: str):
     ticker = yf.Ticker(ticker_symbol)
-    # Use lighter requests first to reduce rate-limit pressure on Streamlit Cloud.
     hist = ticker.history(period="1d", interval="5m", prepost=True)
     if hist.empty:
         hist = ticker.history(period="5d", interval="1d")
@@ -63,14 +132,14 @@ def get_stock_snapshot(ticker_symbol: str):
     return current_price, expirations, ts.tz_convert("UTC").isoformat()
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1200)
 def get_option_chain(ticker_symbol: str, expiration_date: str):
     ticker = yf.Ticker(ticker_symbol)
     opt = ticker.option_chain(expiration_date)
     return opt.calls.copy(), opt.puts.copy()
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=1800)
 def get_recent_touch_count(ticker_symbol: str, level: float, band_pct: float = 0.0015):
     ticker = yf.Ticker(ticker_symbol)
     intraday = ticker.history(period="5d", interval="5m")
@@ -81,6 +150,79 @@ def get_recent_touch_count(ticker_symbol: str, level: float, band_pct: float = 0
     upper = level * (1 + band_pct)
     touches = intraday[(intraday["Low"] <= upper) & (intraday["High"] >= lower)]
     return int(len(touches))
+
+
+def safe_get_stock_snapshot(ticker_symbol: str):
+    cache_key = "snapshot_cache"
+    cached = _safe_get_state(cache_key, None)
+
+    result, status = _safe_call(get_stock_snapshot, ticker_symbol)
+    if result is not None:
+        current_price, expirations, spot_ts_utc = result
+        _safe_set_state(
+            cache_key,
+            {
+                "current_price": current_price,
+                "expirations": expirations,
+                "spot_ts_utc": spot_ts_utc,
+                "cached_at": _now_utc().isoformat(),
+            },
+        )
+        return current_price, expirations, spot_ts_utc, False
+
+    if cached:
+        return cached["current_price"], cached["expirations"], cached["spot_ts_utc"], True
+
+    _show_block_notice()
+    raise RuntimeError("Failed to fetch stock snapshot.")
+
+
+def safe_get_option_chain(ticker_symbol: str, expiration_date: str):
+    cache_key = "option_chain_cache"
+    cache_store = _safe_get_state(cache_key, {})
+    cached = cache_store.get(expiration_date)
+
+    result, status = _safe_call(get_option_chain, ticker_symbol, expiration_date)
+    if result is not None:
+        calls, puts = result
+        cache_store[expiration_date] = {
+            "calls": calls,
+            "puts": puts,
+            "cached_at": _now_utc().isoformat(),
+        }
+        _safe_set_state(cache_key, cache_store)
+        return calls, puts, False
+
+    if cached:
+        return cached["calls"], cached["puts"], True
+
+    if status in ("blocked", "ratelimit"):
+        _show_block_notice()
+    raise RuntimeError(f"Failed to fetch option chain for {expiration_date}.")
+
+
+def safe_get_touch_count(ticker_symbol: str, level: float):
+    cache_key = "touch_count_cache"
+    cache_store = _safe_get_state(cache_key, {})
+    level_key = f"{level:.2f}"
+    cached = cache_store.get(level_key)
+
+    result, status = _safe_call(get_recent_touch_count, ticker_symbol, level)
+    if result is not None:
+        touch_count = result
+        cache_store[level_key] = {
+            "touch_count": touch_count,
+            "cached_at": _now_utc().isoformat(),
+        }
+        _safe_set_state(cache_key, cache_store)
+        return touch_count, False
+
+    if cached:
+        return cached["touch_count"], True
+
+    if status in ("blocked", "ratelimit"):
+        _show_block_notice()
+    return 0, False
 
 
 def calc_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
@@ -98,7 +240,6 @@ def calc_max_pain(calls: pd.DataFrame, puts: pd.DataFrame):
         call_pain = ((strike - calls["strike"]).clip(lower=0) * calls["openInterest"]).sum()
         put_pain = ((puts["strike"] - strike).clip(lower=0) * puts["openInterest"]).sum()
         total_pain = float(call_pain + put_pain)
-
         if total_pain < min_pain:
             min_pain = total_pain
             best_strike = float(strike)
@@ -187,36 +328,38 @@ def classify_max_pain_gravity(current_price: float, max_pain: float | None, put_
 
 
 ticker_symbol = "QQQ"
+
+if _show_block_notice():
+    st.caption("Using cached data where available.")
+
 try:
-    current_price, expirations, spot_ts_utc = get_stock_snapshot(ticker_symbol)
+    current_price, expirations, spot_ts_utc, snapshot_from_cache = safe_get_stock_snapshot(ticker_symbol)
 except Exception as error:  # noqa: BLE001
-    if is_yf_rate_limit_error(error):
-        st.error("Yahoo Finance 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.")
-        st.info("Streamlit Cloud에서 요청이 몰리면 일시적으로 차단될 수 있습니다. 1~5분 후 새로고침해 보세요.")
-    else:
-        st.error(f"주가 데이터를 불러오는 중 오류가 발생했습니다: {error}")
+    st.error(f"Failed to load base market data: {error}")
     st.stop()
 
 if current_price is None or not expirations:
-    st.error("Failed to load stock/option data from Yahoo Finance.")
+    st.error("Failed to load stock/option list from Yahoo Finance.")
     st.stop()
+
+if snapshot_from_cache:
+    cached_meta = _safe_get_state("snapshot_cache", {})
+    st.caption(f"Using cached snapshot (saved at {cached_meta.get('cached_at', 'N/A')}).")
 
 col1, col2 = st.columns([1, 3])
 with col1:
     selected_date = st.selectbox("Select expiry", expirations)
     st.caption(f"AI model order: {' -> '.join(MODEL_CANDIDATES)}")
     st.metric(label=f"{ticker_symbol} spot", value=f"${current_price:.2f}")
-    if st.button("Refresh data"):
-        st.cache_data.clear()
+
+    blocked, _, _ = _get_rate_limit_block()
+    if st.button("Refresh data", disabled=blocked):
         st.rerun()
 
 try:
-    calls, puts = get_option_chain(ticker_symbol, selected_date)
+    calls, puts, chain_from_cache = safe_get_option_chain(ticker_symbol, selected_date)
 except Exception as error:  # noqa: BLE001
-    if is_yf_rate_limit_error(error):
-        st.error("옵션 체인 조회가 Yahoo Finance 요청 한도에 걸렸습니다. 잠시 후 다시 시도해 주세요.")
-    else:
-        st.error(f"옵션 체인을 불러오는 중 오류가 발생했습니다: {error}")
+    st.error(f"Failed to load option chain: {error}")
     st.stop()
 
 min_strike = current_price * 0.90
@@ -232,18 +375,9 @@ call_wall_idx = calls["openInterest"].idxmax()
 put_wall_idx = puts["openInterest"].idxmax()
 call_wall_strike = float(calls.loc[call_wall_idx, "strike"])
 put_wall_strike = float(puts.loc[put_wall_idx, "strike"])
-call_wall_oi = int(calls.loc[call_wall_idx, "openInterest"])
-put_wall_oi = int(puts.loc[put_wall_idx, "openInterest"])
 
 max_pain = calc_max_pain(calls, puts)
-try:
-    touch_count_5d = get_recent_touch_count(ticker_symbol, put_wall_strike)
-except Exception as error:  # noqa: BLE001
-    touch_count_5d = 0
-    if is_yf_rate_limit_error(error):
-        st.warning("5일 터치 빈도 데이터는 요청 한도로 인해 이번 실행에서 제외되었습니다.")
-    else:
-        st.warning(f"5일 터치 빈도 데이터 조회 실패: {error}")
+touch_count_5d, touch_count_from_cache = safe_get_touch_count(ticker_symbol, put_wall_strike)
 option_ts_utc = get_option_last_trade_utc(calls, puts)
 
 put_gap_pct = ((current_price - put_wall_strike) / current_price) * 100
@@ -309,6 +443,13 @@ fig.update_layout(
 
 with col2:
     st.plotly_chart(fig, use_container_width=True)
+
+if chain_from_cache:
+    cache_meta = _safe_get_state("option_chain_cache", {}).get(selected_date, {})
+    st.caption(f"Using cached option-chain (saved at {cache_meta.get('cached_at', 'N/A')}).")
+if touch_count_from_cache:
+    touch_meta = _safe_get_state("touch_count_cache", {}).get(f"{put_wall_strike:.2f}", {})
+    st.caption(f"Touch-count is cached (saved at {touch_meta.get('cached_at', 'N/A')}).")
 
 st.markdown("### Data Timestamps")
 st.caption(f"Spot update: {spot_et} / {spot_kst} | Option chain last trade: {opt_et} / {opt_kst}")
