@@ -39,10 +39,17 @@ def generate_briefing_with_fallback(_client: OpenAI, prompt_text: str):
     return "", None, last_error
 
 
-@st.cache_data(ttl=120)
+def is_yf_rate_limit_error(error: Exception) -> bool:
+    return error.__class__.__name__ == "YFRateLimitError"
+
+
+@st.cache_data(ttl=600)
 def get_stock_snapshot(ticker_symbol: str):
     ticker = yf.Ticker(ticker_symbol)
-    hist = ticker.history(period="1d", interval="1m", prepost=True)
+    # Use lighter requests first to reduce rate-limit pressure on Streamlit Cloud.
+    hist = ticker.history(period="1d", interval="5m", prepost=True)
+    if hist.empty:
+        hist = ticker.history(period="5d", interval="1d")
     if hist.empty:
         return None, [], None
 
@@ -56,14 +63,14 @@ def get_stock_snapshot(ticker_symbol: str):
     return current_price, expirations, ts.tz_convert("UTC").isoformat()
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=600)
 def get_option_chain(ticker_symbol: str, expiration_date: str):
     ticker = yf.Ticker(ticker_symbol)
     opt = ticker.option_chain(expiration_date)
     return opt.calls.copy(), opt.puts.copy()
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=900)
 def get_recent_touch_count(ticker_symbol: str, level: float, band_pct: float = 0.0015):
     ticker = yf.Ticker(ticker_symbol)
     intraday = ticker.history(period="5d", interval="5m")
@@ -180,7 +187,15 @@ def classify_max_pain_gravity(current_price: float, max_pain: float | None, put_
 
 
 ticker_symbol = "QQQ"
-current_price, expirations, spot_ts_utc = get_stock_snapshot(ticker_symbol)
+try:
+    current_price, expirations, spot_ts_utc = get_stock_snapshot(ticker_symbol)
+except Exception as error:  # noqa: BLE001
+    if is_yf_rate_limit_error(error):
+        st.error("Yahoo Finance 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.")
+        st.info("Streamlit Cloud에서 요청이 몰리면 일시적으로 차단될 수 있습니다. 1~5분 후 새로고침해 보세요.")
+    else:
+        st.error(f"주가 데이터를 불러오는 중 오류가 발생했습니다: {error}")
+    st.stop()
 
 if current_price is None or not expirations:
     st.error("Failed to load stock/option data from Yahoo Finance.")
@@ -195,7 +210,14 @@ with col1:
         st.cache_data.clear()
         st.rerun()
 
-calls, puts = get_option_chain(ticker_symbol, selected_date)
+try:
+    calls, puts = get_option_chain(ticker_symbol, selected_date)
+except Exception as error:  # noqa: BLE001
+    if is_yf_rate_limit_error(error):
+        st.error("옵션 체인 조회가 Yahoo Finance 요청 한도에 걸렸습니다. 잠시 후 다시 시도해 주세요.")
+    else:
+        st.error(f"옵션 체인을 불러오는 중 오류가 발생했습니다: {error}")
+    st.stop()
 
 min_strike = current_price * 0.90
 max_strike = current_price * 1.10
@@ -214,7 +236,14 @@ call_wall_oi = int(calls.loc[call_wall_idx, "openInterest"])
 put_wall_oi = int(puts.loc[put_wall_idx, "openInterest"])
 
 max_pain = calc_max_pain(calls, puts)
-touch_count_5d = get_recent_touch_count(ticker_symbol, put_wall_strike)
+try:
+    touch_count_5d = get_recent_touch_count(ticker_symbol, put_wall_strike)
+except Exception as error:  # noqa: BLE001
+    touch_count_5d = 0
+    if is_yf_rate_limit_error(error):
+        st.warning("5일 터치 빈도 데이터는 요청 한도로 인해 이번 실행에서 제외되었습니다.")
+    else:
+        st.warning(f"5일 터치 빈도 데이터 조회 실패: {error}")
 option_ts_utc = get_option_last_trade_utc(calls, puts)
 
 put_gap_pct = ((current_price - put_wall_strike) / current_price) * 100
